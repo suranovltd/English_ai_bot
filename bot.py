@@ -1,139 +1,46 @@
-# bot.py — Kyrgyz→English tutor, text-only, minimal traffic.
-# Меню всегда видно. Команды:
-# /lesson — следующий урок
-# /repeat — повтор текущего
-# /review_prev — повтор предыдущего (без отката прогресса)
-# /review_next — просмотр следующего (без сдвига прогресса)
-# /jump_to N — перейти к уроку №N (в пределах текущего уровня, без запуска; затем /lesson)
-# /progress, /setlevel, /reset
-# Requires: python-telegram-bot==20.3
+# bot.py
+# English tutor (text-only) for Kyrgyz speakers.
+# UI: кыргызча түшүндүрмө жана меню, мисалдар/тапшырмалар англисче.
+# Requires: python-telegram-bot==20.3, openai>=1.30, python-dotenv
+# ENV: TELEGRAM_BOT_TOKEN, OPENAI_API_KEY
 
-import os, json
+import os, json, time
 from pathlib import Path
-from typing import Dict, Any, List, Optional
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from typing import Dict, Any, Tuple, List
+
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
 
-LEVELS = ["Beginner","Elementary","Pre-Intermediate","Intermediate","Upper-Intermediate","Advanced"]
-DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
+# -------------------- Конфигурация жана файлдар --------------------
+LEVELS: List[str] = [
+    "Beginner", "Elementary", "Pre-Intermediate",
+    "Intermediate", "Upper-Intermediate", "Advanced"
+]
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 USERS_DB = DATA_DIR / "users.json"
-OK_EMOJI, WARN_EMOJI = "✅", "⚠️"
 
-# ---- Мини-курс ----
-CURRICULUM: Dict[str, List[Dict[str, Any]]] = {
-    "Beginner": [
-        {"title":"Greetings & Simple Introductions",
-         "expl":"Basic greetings and self-intro. (Саламдашуу жана өзүң жөнүндө кыскача маалымат)",
-         "examples":["Hello! My name is Aida.","I am from Bishkek.","Nice to meet you!"],
-         "task":"Write a 2-line self-introduction: greet + your name; city or country.",
-         "answer_keywords":["my name","i am from","hello","hi"]},
-        {"title":"To be (am/is/are) — basics",
-            "expl":"Use am/is/are with I/you/he/she/they. (am/is/are — жөнөкөй колдонуу)",
-            "examples":["I am a student.","She is a teacher.","They are friends."],
-            "task":"Make 2 sentences with am/is/are about you or family.",
-            "answer_keywords":[" i am "," is "," are "]},
-        {"title":"Everyday objects & a/an",
-            "expl":"Use a/an before singular nouns. (a/an — артикль, бирдик санда)",
-            "examples":["This is a book.","I have an apple."],
-            "task":"Write 2 sentences using a/an with objects around you.",
-            "answer_keywords":[" a "," an "]},
-    ],
-    "Elementary": [
-        {"title":"Present Simple (habits)",
-         "expl":"Use Present Simple for routines. (Күндөлүк аракеттерге Present Simple)",
-         "examples":["I wake up at 7.","She works in a bank."],
-         "task":"Write 2 sentences about your daily routine (Present Simple).",
-         "answer_keywords":[" i "," she "," he "," every "," usually "," often "]},
-        {"title":"There is/There are",
-         "expl":"There is/are to talk about existence. (бир нерсенин бар экенин айтуу)",
-         "examples":["There is a park near my house.","There are two chairs in the room."],
-         "task":"Make 2 sentences: one with 'There is', one with 'There are'.",
-         "answer_keywords":["there is","there are"]},
-        {"title":"Can (ability)",
-         "expl":"Can to express ability. (жөндөмдү айтуу)",
-         "examples":["I can swim.","She can speak English."],
-         "task":"Write 2 sentences with 'can' about skills.",
-         "answer_keywords":[" can "]},
-    ],
-    "Pre-Intermediate": [
-        {"title":"Past Simple (regular/irregular)",
-         "expl":"Finished past actions. (Өткөн чак)",
-         "examples":["I visited Osh last year.","She went to the market."],
-         "task":"Write 2 sentences in Past Simple (one regular, one irregular verb).",
-         "answer_keywords":["ed "," went"," did "," saw"," visited"," played"]},
-        {"title":"Comparatives",
-         "expl":"Use -er/more for comparisons. (салыштыруу формалары)",
-         "examples":["Bishkek is bigger than Naryn.","This book is more interesting."],
-         "task":"Write 2 comparative sentences.",
-         "answer_keywords":[" than"," more "," -er"]},
-        {"title":"Future (will / going to)",
-         "expl":"Future plans/decisions. (Келечек мезгил)",
-         "examples":["I will call you tomorrow.","I am going to study English tonight."],
-         "task":"Write 2 future sentences (one with will, one with going to).",
-         "answer_keywords":[" will "," going to "]},
-    ],
-    "Intermediate": [
-        {"title":"Present Continuous (now/temporary)",
-         "expl":"Actions happening now. (Азыркы уланма мезгил)",
-         "examples":["I am studying English now.","They are working on a project."],
-         "task":"Write 2 Present Continuous sentences about current actions.",
-         "answer_keywords":[" am "," is "," are ","ing"]},
-        {"title":"Present Perfect (experience)",
-         "expl":"Have/has + V3 for life experience. (тажрыйба)",
-         "examples":["I have visited Issyk-Kul.","She has finished her homework."],
-         "task":"Write 2 Present Perfect sentences (have/has + V3).",
-         "answer_keywords":[" have "," has ","ed"," been"," done"," seen"]},
-        {"title":"Modal advice (should)",
-         "expl":"Use should for advice. (Кеңеш берүү)",
-         "examples":["You should practice every day.","He should sleep more."],
-         "task":"Give 2 pieces of advice using 'should'.",
-         "answer_keywords":[" should "]},
-    ],
-    "Upper-Intermediate": [
-        {"title":"Conditionals (Type 1)",
-         "expl":"If + Present, will + base. (Шарттуу сүйлөм 1-тип)",
-         "examples":["If you study, you will improve.","If it rains, we will stay home."],
-         "task":"Write 2 Type-1 conditional sentences.",
-         "answer_keywords":[" if "," will "]},
-        {"title":"Passive Voice (present/past)",
-         "expl":"Be + V3. (Пассив)",
-         "examples":["English is spoken here.","The house was built in 1990."],
-         "task":"Write 2 passive sentences (present & past).",
-         "answer_keywords":[" is "," are "," was "," were "," by "]},
-        {"title":"Linking words",
-         "expl":"Use connectors. (байланыштыруучу сөздөр)",
-         "examples":["However, I prefer tea.","Because I was tired, I slept early."],
-         "task":"Write 2 sentences with linking words (however/because/therefore).",
-         "answer_keywords":["however","because","therefore"]},
-    ],
-    "Advanced": [
-        {"title":"Paraphrasing",
-         "expl":"Say same idea differently. (сөзмө-сөз эмес баяндоо)",
-         "examples":["The movie was very good. → The film was excellent.",
-                     "She is busy. → She has a lot on her plate."],
-         "task":"Paraphrase: 'Learning regularly leads to progress.'",
-         "answer_keywords":["regular","consist","progress","improve","leads","results"]},
-        {"title":"Formal vs Informal",
-         "expl":"Choose style by context. (расмий/бейрасмий)",
-         "examples":["Formal: I would appreciate your reply.","Informal: Text me back!"],
-         "task":"Write 1 formal and 1 informal version of the same request.",
-         "answer_keywords":["would","appreciate","please","text","hi","hey"]},
-        {"title":"Cohesion & coherence",
-         "expl":"Topic sentences and references. (логикалык ыраат)",
-         "examples":["Firstly, Secondly, Finally…","This/These/Therefore…"],
-         "task":"Write 3–4 lines on ‘Why I learn English’, using at least two linking words.",
-         "answer_keywords":["first","second","finally","therefore","because","however"]},
-    ],
-}
+# Тутордун стили: кыргызча мета-нускама, англисче мазмун
+SYSTEM_STYLE = (
+    "Сен 'Chatty' аттуу жылуу, достук мүнөздөгү англис тили мугалимисиз.\n"
+    "Баардык түшүндүрмөнү жана нускаманы КЫРГЫЗ ТИЛИНДЕ бер.\n"
+    "Диалогдор, мисалдар, сөз айкаштары жана тапшырмалардын текстин АНГЛИС ТИЛИНДЕ жаз.\n"
+    "Кыска, түшүнүктүү, практикалык бол. Робот сымал сүйлөбө — жандуу сүйлөө колдон.\n"
+    "Каталарды назик оңдоп, 1–2 так мисал бер. Ар кадамда 1–2 гана тапшырма.\n"
+    "Тема алмаштырбайбыз: максат — англис тилин үйрөтүү. Башка темаларга жооп бербе."
+)
 
-# ---- Storage ----
+# -------------------- Жөнөкөй JSON сактагыч --------------------
 def load_db() -> Dict[str, Any]:
     if USERS_DB.exists():
-        try: return json.loads(USERS_DB.read_text(encoding="utf-8"))
-        except Exception: return {}
+        try:
+            return json.loads(USERS_DB.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
     return {}
 
 def save_db(db: Dict[str, Any]) -> None:
@@ -141,278 +48,320 @@ def save_db(db: Dict[str, Any]) -> None:
     tmp.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(USERS_DB)
 
-# user state:
-# level, lesson_idx, pending
-# review_mode (bool), review_idx (int|None) — для /review_prev и /review_next
-DB = load_db()
-def userc(uid: int) -> Dict[str, Any]:
-    sid = str(uid)
+DB = load_db()  # { user_id: {level, goals, streak, last_lesson_ts, pending_task, history} }
+
+def userc(user_id: int) -> Dict[str, Any]:
+    sid = str(user_id)
     if sid not in DB:
-        DB[sid] = {"level": None, "lesson_idx": 0, "pending": False, "review_mode": False, "review_idx": None}
+        DB[sid] = {
+            "level": None,       # "Beginner" ж.б.
+            "goals": [],         # ["speaking", "grammar"] ж.б.
+            "streak": 0,         # канча тапшырма ийгиликтүү текшерилди
+            "last_lesson_ts": 0, # акыркы /lesson убактысы
+            "pending_task": None, # {"task": ..., "key": ...}
+            "history": []        # акыркы 20 билдирүү (контекст үчүн)
+        }
     return DB[sid]
 
-# ---- Keyboards ----
-def level_kb() -> InlineKeyboardMarkup:
+# -------------------- OpenAI --------------------
+from openai import OpenAI
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+async def gpt(messages, model="gpt-4o-mini", max_tokens=500) -> str:
+    """Жооп текстине гана муктажбыз."""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=max_tokens,
+    )
+    return resp.choices[0].message.content.strip()
+
+def tutor_messages(level: str, goals: list, history: list, user_prompt: str, mode_hint: str = ""):
+    """Тутор үчүн контекст түзүү."""
+    level_str = level or "not set"
+    goals_str = ", ".join(goals) if goals else "none"
+    sys = (
+        f"{SYSTEM_STYLE}\n"
+        f"Студенттин деңгээли: {level_str}.\n"
+        f"Студенттин максаттары: {goals_str}.\n"
+        f"{mode_hint}"
+    )
+    msgs = [{"role": "system", "content": sys}]
+    for role, text in history[-12:]:
+        msgs.append({"role": role, "content": text})
+    msgs.append({"role": "user", "content": user_prompt})
+    return msgs
+
+# -------------------- Клавиатура/Меню --------------------
+def level_keyboard() -> InlineKeyboardMarkup:
     rows, row = [], []
     for i, lvl in enumerate(LEVELS, 1):
         row.append(InlineKeyboardButton(lvl, callback_data=f"level|{lvl}"))
-        if i % 2 == 0: rows.append(row); row = []
+        if i % 2 == 0:
+            rows.append(row); row = []
     if row: rows.append(row)
     return InlineKeyboardMarkup(rows)
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    rows = [
-        ["/lesson", "/repeat"],
-        ["/review_prev", "/review_next"],
-        ["/progress", "/setlevel"],
-        ["/reset"]
-    ]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=False)
+def yesno_keyboard(cb_yes: str, cb_no: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Ооба", callback_data=cb_yes),
+         InlineKeyboardButton("Жок", callback_data=cb_no)]
+    ])
 
-# ---- Helpers ----
-def tiny(s: str) -> str: return s.strip().replace("\n\n","\n")
-
-def check_keywords(answer: str, keywords: List[str]) -> bool:
-    a = " " + answer.lower() + " "
-    hit = sum(1 for k in keywords if k in a)
-    return hit >= 1 if len(keywords) <= 3 else hit >= 2
-
-def next_lesson_or_level(u: Dict[str, Any]) -> str:
-    level, idx = u["level"], u["lesson_idx"] + 1
-    lessons = CURRICULUM[level]
-    if idx < len(lessons):
-        u["lesson_idx"] = idx
-        return f"{OK_EMOJI} Good! Next lesson in *{level}* is ready. Tap /lesson."
-    pos = LEVELS.index(level)
-    if pos + 1 < len(LEVELS):
-        new_level = LEVELS[pos + 1]
-        u["level"], u["lesson_idx"] = new_level, 0
-        return f"{OK_EMOJI} Level *{level}* completed! Moved to *{new_level}*. Tap /lesson."
-    return f"{OK_EMOJI} You completed *Advanced*! Great job! Use /lesson to review."
-
-# ---- Commands ----
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Салам! Кыргыз мугалим катары англис тилин үйрөтөм.\nChoose your level:",
-        reply_markup=level_kb()
+def menu_text(u: Dict[str, Any]) -> str:
+    lvl = u.get("level") or "— коюла элек —"
+    goals = ", ".join(u.get("goals", [])) or "жок"
+    streak = int(u.get("streak", 0))
+    return (
+        "📋 *Меню*\n"
+        f"• Деңгээлиңиз: *{lvl}*\n"
+        f"• Максаттар: *{goals}*\n"
+        f"• Прогресс (тапшырма саны): *{streak}*\n\n"
+        "Командалар:\n"
+        "• /setlevel — деңгээл тандоо\n"
+        "• /goals — максаттарды коюу (мис: speaking, grammar)\n"
+        "• /lesson — жаңы кыска сабак + 1 тапшырма\n"
+        "• /repeat — акыркы тапшырманы кайра көрүү\n"
+        "• /reset — бардык маалыматты тазалоо\n"
+        "• /menu — менюну көрсөтүү\n"
     )
+
+# -------------------- Сабак/Тапшырма генерациясы --------------------
+async def build_intro_lesson(level: str) -> str:
+    """Кыска жылуу кириш сөз + англисче материал."""
+    prompt = (
+        "Бардык түшүндүрмө/мета-нускама КЫРГЫЗ ТИЛИНДЕ болсун. "
+        "Сабактын мазмуну (диалог, мисалдар, тапшырма тексттери) АНГЛИС ТИЛИНДЕ.\n"
+        f"Create a short warm-up for a {level} learner:\n"
+        "- a 3–4 line mini-dialogue to read and imitate\n"
+        "- 3 focused items (grammar/vocab/pronunciation) with 1-line tips\n"
+        "- keep it friendly and concise"
+    )
+    return await gpt(
+        [{"role": "system", "content": SYSTEM_STYLE}, {"role": "user", "content": prompt}],
+        max_tokens=450
+    )
+
+async def build_task(level: str, goals: list) -> Tuple[str, str]:
+    """
+    Бир эле тапшырма түзөт. Кайтарат: (тапшырма текст/инструкция англисче, текшерүү үчүн кыска ачкыч).
+    """
+    goals_text = ", ".join(goals) if goals else "general English"
+    prompt = (
+        "Мета-нускама КЫРГЫЗ ТИЛИНДЕ, бирок тапшырма текстин англисче бер.\n"
+        f"Design ONE short exercise for a {level} learner focused on {goals_text}.\n"
+        "Output in TWO PARTS exactly:\n"
+        "---TASK---\n"
+        "<one concise instruction in ENGLISH; student's answer fits in 1–3 lines>\n"
+        "---KEY---\n"
+        "<ideal answer or checklist for the tutor>"
+    )
+    out = await gpt(
+        [{"role": "system", "content": SYSTEM_STYLE}, {"role": "user", "content": prompt}],
+        max_tokens=500
+    )
+    task, key = "", ""
+    if "---TASK---" in out and "---KEY---" in out:
+        _, rest = out.split("---TASK---", 1)
+        task_part, key_part = rest.split("---KEY---", 1)
+        task = task_part.strip()
+        key = key_part.strip()
+    else:
+        task = out.strip()
+        key = "No formal key; judge clarity, grammar, relevance."
+    return task, key
+
+async def check_answer(level: str, task: str, key: str, answer: str) -> str:
+    """Кыргызча кыска пикир."""
+    prompt = (
+        "Баалоону КЫРГЫЗ ТИЛИНДЕ жаз. Студенттин жообу англисче.\n"
+        f"Student level: {level}\n\n"
+        f"Task (EN):\n{task}\n\n"
+        f"Answer key (EN):\n{key}\n\n"
+        f"Student answer (EN):\n{answer}\n\n"
+        "Кыска пикир (5 сапка чейин):\n"
+        "- тууралыгы (✅/⚠️/❌) жана 1 себеби\n"
+        "- 1–2 майда оңдоо (мисал менен)\n"
+        "- кийинки кичине тапшырма боюнча сунуш"
+    )
+    return await gpt(
+        [{"role": "system", "content": SYSTEM_STYLE}, {"role": "user", "content": prompt}],
+        max_tokens=350
+    )
+
+# -------------------- Командалар --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = userc(update.effective_user.id)
+    if not u["level"]:
+        await update.message.reply_text(
+            "Салам! Алгач деңгээлиңизди тандап алалы:", reply_markup=level_keyboard()
+        )
+    else:
+        await update.message.reply_text(
+            "Кайра кош келиңиз! Төмөнкү менюдан тандаңыз:\n\n" + menu_text(u),
+            parse_mode="Markdown"
+        )
+
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = userc(update.effective_user.id)
+    await update.message.reply_text(menu_text(u), parse_mode="Markdown")
 
 async def setlevel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Choose your level:", reply_markup=level_kb())
-
-async def progress(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = userc(update.effective_user.id)
-    if not u["level"]:
-        await update.message.reply_text("No level yet. Use /start.", reply_markup=main_menu_kb()); return
-    level, idx, total = u["level"], u["lesson_idx"], len(CURRICULUM[u["level"]])
-    stat = "waiting for your answer" if u["pending"] else "ready"
-    if u["review_mode"]:
-        stat = f"reviewing lesson {u['review_idx']+1}"
-    await update.message.reply_text(
-        f"Level: *{level}*\nLesson: {idx+1}/{total}\nStatus: {stat}",
-        parse_mode="Markdown", reply_markup=main_menu_kb()
-    )
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    DB[str(update.effective_user.id)] = {"level": None, "lesson_idx": 0, "pending": False, "review_mode": False, "review_idx": None}
-    save_db(DB)
-    await update.message.reply_text("Data reset. Use /start.", reply_markup=main_menu_kb())
+    await update.message.reply_text("Деңгээлиңизди тандаңыз:", reply_markup=level_keyboard())
 
 async def on_level_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    await q.answer()
     _, lvl = q.data.split("|", 1)
     u = userc(q.from_user.id)
-    u["level"], u["lesson_idx"] = lvl, 0
-    u["pending"], u["review_mode"], u["review_idx"] = False, False, None
+    u["level"] = lvl
     save_db(DB)
-    await q.edit_message_text(f"Level set: *{lvl}* ✅", parse_mode="Markdown")
-    await q.message.reply_text("Tap /lesson to begin your first lesson.", reply_markup=main_menu_kb())
+    await q.edit_message_text(f"Деңгээлиңиз коюлду: *{lvl}* ✅", parse_mode="Markdown")
+    await q.message.reply_text(
+        "Максаттарды коёсузбу? (мисалы: speaking, grammar, travel)",
+        reply_markup=yesno_keyboard("goals|yes", "goals|no")
+    )
 
-async def lesson(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def on_goals_yesno(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, ans = q.data.split("|", 1)
+    if ans == "yes":
+        await q.edit_message_text("Максаттарыңызды үтүр менен жазыңыз. Мис: speaking, travel, pronunciation")
+        context.user_data["awaiting_goals"] = True
+    else:
+        await q.edit_message_text("Максаттарды кийин /goals аркылуу коюуга болот.\n/lesson менен баштай бериңиз.")
+        # меню көрсөт
+        u = userc(q.from_user.id)
+        await q.message.reply_text(menu_text(u), parse_mode="Markdown")
+
+async def goals_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    userc(update.effective_user.id)  # ensure
+    await update.message.reply_text("Максаттарыңызды үтүр менен жазыңыз. Мис: speaking, grammar, business email")
+    context.user_data["awaiting_goals"] = True
+
+async def lesson_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = userc(update.effective_user.id)
     if not u["level"]:
-        await update.message.reply_text("Please set your level: /setlevel", reply_markup=main_menu_kb()); return
-    if u["pending"]:
-        await update.message.reply_text("You have a pending task. Send your answer first.", reply_markup=main_menu_kb()); return
+        await update.message.reply_text("Адегенде деңгээл коёбуз: /setlevel")
+        return
+    now = time.time()
+    if now - u["last_lesson_ts"] < 10:
+        await update.message.reply_text("Бир аз күтө туруңуз… мурдагы өтүнүч иштелүүдө.")
+        return
 
-    level, idx = u["level"], u["lesson_idx"]
-    lessons = CURRICULUM[level]
-    if idx >= len(lessons):
-        await update.message.reply_text("Level complete. I will move you forward automatically. /progress", reply_markup=main_menu_kb()); return
+    await update.message.reply_text("Кыска кириш сабак даярдалып жатат…")
+    intro = await build_intro_lesson(u["level"])
+    await update.message.reply_text(intro)
 
-    L = lessons[idx]
-    u["pending"], u["review_mode"], u["review_idx"] = True, False, None
+    task, key = await build_task(u["level"], u["goals"])
+    u["pending_task"] = {"task": task, "key": key}
+    u["last_lesson_ts"] = now
     save_db(DB)
-    text = (
-        f"*{level} · Lesson {idx+1}: {L['title']}*\n"
-        f"{tiny(L['expl'])}\n\n"
-        f"_Examples:_\n- " + "\n- ".join(L["examples"]) + "\n\n"
-        f"*Task:* {L['task']}\n\n"
-        f"Reply here with your answer (one message)."
+
+    await update.message.reply_text(
+        f"*Сиздин тапшырмаңыз (EN):*\n{task}\n\nЖообуңузду ушул чатка жазыңыз (бир билдирүү).",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
+    # меню
+    await update.message.reply_text(menu_text(u), parse_mode="Markdown")
 
 async def repeat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = userc(update.effective_user.id)
-    if not u["level"]:
-        await update.message.reply_text("Please set your level: /setlevel", reply_markup=main_menu_kb()); return
-    level, idx = u["level"], u["lesson_idx"]
-    lessons = CURRICULUM[level]
-    if idx >= len(lessons): idx = len(lessons)-1
-    L = lessons[idx]
-    u["pending"], u["review_mode"], u["review_idx"] = True, False, None
+    if u.get("pending_task"):
+        await update.message.reply_text(
+            f"*Акыркы тапшырма (EN):*\n{u['pending_task']['task']}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("Акыркы тапшырма табылган жок. /lesson деп жаңы сабак алыңыз.")
+    await update.message.reply_text(menu_text(u), parse_mode="Markdown")
+
+async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    DB[str(update.effective_user.id)] = {
+        "level": None, "goals": [], "streak": 0,
+        "last_lesson_ts": 0, "pending_task": None, "history": []
+    }
     save_db(DB)
-    text = (
-        f"*Repeat — {level} · Lesson {idx+1}: {L['title']}*\n"
-        f"{tiny(L['expl'])}\n\n"
-        f"_Examples:_\n- " + "\n- ".join(L["examples"]) + "\n\n"
-        f"*Task:* {L['task']}\n\n"
-        f"Reply again with your answer."
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
+    await update.message.reply_text("Маалыматыңыз тазаланды. /start деп кайра баштаңыз.")
+    await update.message.reply_text(menu_text(userc(update.effective_user.id)), parse_mode="Markdown")
 
-async def review_prev_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = userc(update.effective_user.id)
-    if not u["level"]:
-        await update.message.reply_text("Please set your level: /setlevel", reply_markup=main_menu_kb()); return
-    if u["pending"]:
-        await update.message.reply_text("Finish the current task first, then /review_prev.", reply_markup=main_menu_kb()); return
+# -------------------- Текст билдирүүлөр --------------------
+ALLOWED_WORDS = {"hello", "hi", "ok", "thanks", "thank you"}  # майда реакцияга уруксат
 
-    level, idx = u["level"], u["lesson_idx"]
-    if idx == 0:
-        await update.message.reply_text("No previous lesson at this level. Start /lesson.", reply_markup=main_menu_kb()); return
-
-    review_idx = idx - 1
-    L = CURRICULUM[level][review_idx]
-    u["pending"], u["review_mode"], u["review_idx"] = True, True, review_idx
-    save_db(DB)
-    text = (
-        f"*Review Previous — {level} · Lesson {review_idx+1}: {L['title']}*\n"
-        f"{tiny(L['expl'])}\n\n"
-        f"_Examples:_\n- " + "\n- ".join(L["examples"]) + "\n\n"
-        f"*Task:* {L['task']}\n\n"
-        f"Reply to review this lesson. (Current progress won't change.)"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
-
-async def review_next_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Посмотреть и отработать СЛЕДУЮЩИЙ урок без сдвига прогресса."""
-    u = userc(update.effective_user.id)
-    if not u["level"]:
-        await update.message.reply_text("Please set your level: /setlevel", reply_markup=main_menu_kb()); return
-    if u["pending"]:
-        await update.message.reply_text("Finish the current task first, then /review_next.", reply_markup=main_menu_kb()); return
-
-    level, idx = u["level"], u["lesson_idx"]
-    lessons = CURRICULUM[level]
-    if idx + 1 >= len(lessons):
-        await update.message.reply_text("No next lesson to review at this level.", reply_markup=main_menu_kb()); return
-
-    review_idx = idx + 1
-    L = lessons[review_idx]
-    u["pending"], u["review_mode"], u["review_idx"] = True, True, review_idx
-    save_db(DB)
-    text = (
-        f"*Review Next — {level} · Lesson {review_idx+1}: {L['title']}*\n"
-        f"{tiny(L['expl'])}\n\n"
-        f"_Examples:_\n- " + "\n- ".join(L["examples"]) + "\n\n"
-        f"*Task:* {L['task']}\n\n"
-        f"Reply to try the next lesson ahead. (Current progress won't change.)"
-    )
-    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_menu_kb())
-
-async def jump_to_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Перейти к уроку №N в текущем уровне (без автоматического запуска).
-       Пользователь потом жмёт /lesson, чтобы начать именно этот урок."""
-    u = userc(update.effective_user.id)
-    if not u["level"]:
-        await update.message.reply_text("Please set your level: /setlevel", reply_markup=main_menu_kb()); return
-    if u["pending"]:
-        await update.message.reply_text("Finish the current task first, then /jump_to N.", reply_markup=main_menu_kb()); return
-
-    args = context.args or []
-    if not args or not args[0].isdigit():
-        await update.message.reply_text("Usage: /jump_to N  (e.g., /jump_to 2)", reply_markup=main_menu_kb()); return
-
-    n = int(args[0])
-    lessons = CURRICULUM[u["level"]]
-    if not (1 <= n <= len(lessons)):
-        await update.message.reply_text(f"Valid range: 1..{len(lessons)}", reply_markup=main_menu_kb()); return
-
-    # set pointer; progress не откатываем и не двигаем автоматически
-    u["lesson_idx"] = n - 1
-    u["review_mode"], u["review_idx"], u["pending"] = False, None, False
-    save_db(DB)
-    await update.message.reply_text(
-        f"Pointer set to lesson {n}. Tap /lesson to start it.",
-        reply_markup=main_menu_kb()
-    )
-
-# ---- Answers only ----
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = userc(update.effective_user.id)
+    uid = update.effective_user.id
+    u = userc(uid)
     txt = (update.message.text or "").strip()
 
-    if not u["pending"]:
-        # Учебный режим: без свободного чата
-        await update.message.reply_text("Tap /lesson to get the next task. Use menu below.", reply_markup=main_menu_kb())
-        return
-
-    level = u["level"]
-    lessons = CURRICULUM[level]
-
-    # Проверка: review_mode (prev/next) или обычный текущий
-    if u.get("review_mode"):
-        ridx = u.get("review_idx", 0)
-        L = lessons[max(0, min(ridx, len(lessons)-1))]
-        ok = check_keywords(txt, L["answer_keywords"])
-        if ok:
-            u["pending"], u["review_mode"], u["review_idx"] = False, False, None
-            save_db(DB)
-            await update.message.reply_text(
-                f"{OK_EMOJI} Good review! (Азаматсың!)\nContinue with your current lesson: /lesson",
-                reply_markup=main_menu_kb()
-            )
-        else:
-            await update.message.reply_text(
-                f"{WARN_EMOJI} Almost there. Use the target pattern from examples and try again.",
-                reply_markup=main_menu_kb()
-            )
-        return
-
-    # Обычная проверка по текущему уроку
-    idx = u["lesson_idx"]
-    L = lessons[idx]
-    ok = check_keywords(txt, L["answer_keywords"])
-    if ok:
-        u["pending"] = False
-        msg = next_lesson_or_level(u)
+    # Максаттарды кабыл алуу
+    if context.user_data.get("awaiting_goals"):
+        goals = [g.strip() for g in txt.split(",") if g.strip()]
+        u["goals"] = goals
+        context.user_data["awaiting_goals"] = False
         save_db(DB)
-        await update.message.reply_text(f"{OK_EMOJI} Good! (Азаматсың!)\n{msg}", reply_markup=main_menu_kb())
-    else:
         await update.message.reply_text(
-            f"{WARN_EMOJI} Almost there. Use the target pattern from examples and try again.",
-            reply_markup=main_menu_kb()
+            f"Максаттар сакталды: {', '.join(goals) if goals else 'жок'}. Эми /lesson деп баштасаңыз болот."
         )
+        await update.message.reply_text(menu_text(u), parse_mode="Markdown")
+        return
 
-# ---- main ----
+    # Тапшырмага жооп келдиби?
+    if u.get("pending_task"):
+        task = u["pending_task"]["task"]
+        key = u["pending_task"]["key"]
+        await update.message.reply_text("Жообуңуз текшерилип жатат…")
+        fb = await check_answer(u["level"], task, key, txt)
+        u["pending_task"] = None
+        u["streak"] = int(u.get("streak", 0)) + 1
+        save_db(DB)
+        await update.message.reply_text(fb)
+        await update.message.reply_text(menu_text(u), parse_mode="Markdown")
+        return
+
+    # Эркин текст: гана окуу тууралуу суроолорго түшүндүрмө (башка темаларга барбайбыз)
+    if any(cmd in txt.lower() for cmd in ["/", "setlevel", "lesson", "goals", "menu", "reset", "repeat"]) \
+       or txt.lower() in ALLOWED_WORDS:
+        # жөн гана меню эсиңизге салайын:
+        await update.message.reply_text(menu_text(u), parse_mode="Markdown")
+        return
+
+    # Болбосо — кыска эскертме
+    await update.message.reply_text(
+        "Бул бот англис тилин үйрөтөт. Командаларды колдонуңуз: /menu\n"
+        "Жаңы сабак үчүн: /lesson"
+    )
+    await update.message.reply_text(menu_text(u), parse_mode="Markdown")
+
+# -------------------- main --------------------
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        print("❌ Missing TELEGRAM_BOT_TOKEN"); return
+    if not token or not OPENAI_API_KEY:
+        print("❌ .env ичинде TELEGRAM_BOT_TOKEN же OPENAI_API_KEY жок")
+        return
+
     app = ApplicationBuilder().token(token).build()
+
+    # Командалар
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu_cmd))
     app.add_handler(CommandHandler("setlevel", setlevel))
-    app.add_handler(CommandHandler("lesson", lesson))
+    app.add_handler(CommandHandler("goals", goals_cmd))
+    app.add_handler(CommandHandler("lesson", lesson_cmd))
     app.add_handler(CommandHandler("repeat", repeat_cmd))
-    app.add_handler(CommandHandler("review_prev", review_prev_cmd))
-    app.add_handler(CommandHandler("review_next", review_next_cmd))
-    app.add_handler(CommandHandler("jump_to", jump_to_cmd))
-    app.add_handler(CommandHandler("progress", progress))
-    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("reset", reset_cmd))
+
+    # Callback'тар
     app.add_handler(CallbackQueryHandler(on_level_pick, pattern=r"^level\|"))
+    app.add_handler(CallbackQueryHandler(on_goals_yesno, pattern=r"^goals\|"))
+
+    # Текст
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    print("✅ Tutor bot (Kyrgyz→English) is running.")
+
+    print("✅ Tutor bot is running. Press Ctrl+C to stop.")
     app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
